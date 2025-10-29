@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  backend:
+    build: .
+    container_name: crypto_backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    working_dir: /app
+    environment:
+      - DATABASE_URL=postgresql+psycopg://postgres:postgres@db:5432/crypto_db
+      - SESSION_TOKEN_TTL_HOURS=24
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+  db:
+    image: postgres:15-alpine
+    container_name: crypto_db
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=crypto_db
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d crypto_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
