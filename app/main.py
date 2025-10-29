@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .database import engine
 from .models import Base
-from .routers import auth, users
+from .routers import auth, crypto, users
 
 
 def create_app() -> FastAPI:
@@ -19,6 +19,7 @@ def create_app() -> FastAPI:
 
     application.include_router(auth.router)
     application.include_router(users.router)
+    application.include_router(crypto.router)
 
     return application
 
