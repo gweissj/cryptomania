@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -15,6 +17,11 @@ class Settings(BaseSettings):
         default="https://api.coingecko.com/api/v3",
         env="COINGECKO_BASE_URL",
         description="Base URL for the CoinGecko API",
+    )
+    coingecko_demo_api_key: Optional[str] = Field(
+        default=None,
+        env="COINGECKO_DEMO_API_KEY",
+        description="CoinGecko demo API key for v3 (header x-cg-demo-api-key)",
     )
 
 

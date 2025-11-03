@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Query, status
 
-from ..services.crypto import fetch_ohlc, fetch_simple_prices
+from ..schemas import CryptoDashboardResponse
+from ..services.crypto import fetch_dashboard, fetch_ohlc, fetch_simple_prices
 
 
 router = APIRouter(prefix="/crypto", tags=["crypto"])
@@ -32,3 +33,8 @@ async def get_ohlc(
         )
 
     return await fetch_ohlc(coin_id, vs_currency.lower(), days)
+
+
+@router.get("/dashboard", response_model=CryptoDashboardResponse)
+async def get_dashboard(vs_currency: str = Query("usd", description="Fiat currency symbol, e.g. usd, eur")):
+    return await fetch_dashboard(vs_currency)

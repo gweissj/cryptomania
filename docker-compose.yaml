@@ -9,6 +9,7 @@ services:
     environment:
       - DATABASE_URL=postgresql+psycopg://postgres:postgres@db:5432/crypto_db
       - SESSION_TOKEN_TTL_HOURS=24
+      - COINGECKO_DEMO_API_KEY=CG-Wu4E9yhdxZKoAnGqJhZLG2j4
     depends_on:
       db:
         condition: service_healthy

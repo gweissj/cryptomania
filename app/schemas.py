@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, EmailStr, constr, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, HttpUrl, constr, field_validator
 
 from .utils import parse_birth_date
 
@@ -65,3 +65,40 @@ class AuthTokenResponse(BaseModel):
 
 class MessageResponse(BaseModel):
     message: str
+
+
+class MarketChartPoint(BaseModel):
+    timestamp: int
+    price: float
+
+
+class MarketMover(BaseModel):
+    id: str
+    name: str
+    symbol: str
+    pair: str
+    current_price: float
+    change_24h_pct: float
+    volume_24h: float
+    image_url: Optional[HttpUrl]
+
+
+class PortfolioAsset(BaseModel):
+    id: str
+    name: str
+    symbol: str
+    quantity: float
+    current_price: float
+    value: float
+    change_24h_pct: float
+    image_url: Optional[HttpUrl]
+
+
+class CryptoDashboardResponse(BaseModel):
+    currency: str
+    portfolio_balance: float
+    balance_change_pct: float
+    chart: list[MarketChartPoint]
+    market_movers: list[MarketMover]
+    portfolio: list[PortfolioAsset]
+    last_updated: datetime
