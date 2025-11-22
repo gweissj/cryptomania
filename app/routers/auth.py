@@ -31,8 +31,6 @@ def register_user(payload: UserCreate, db: Session = Depends(get_db)) -> User:
         first_name=payload.first_name,
         last_name=payload.last_name,
         birth_date=payload.birth_date,
-        region=payload.region,
-        city=payload.city,
     )
     db.add(new_user)
     db.commit()

@@ -46,9 +46,7 @@ python -m uvicorn app.main:app --reload
   "password": "StrongPass123",
   "first_name": "Alice",
   "last_name": "Smith",
-  "birth_date": "1990-05-10",
-  "region": "Moscow",
-  "city": "Moscow"
+  "birth_date": "1990-05-10"
 }
 ```
 

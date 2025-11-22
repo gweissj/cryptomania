@@ -5,7 +5,6 @@ from ..dependencies import get_current_user
 from ..models import User
 from ..schemas import MessageResponse, UserResponse, UserUpdate
 from ..security import hash_password
-from ..utils import AgeRestrictionError, ensure_is_adult
 
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -27,21 +26,19 @@ def update_current_user(
             detail="Failed to access database session for update",
         )
 
-    if payload.birth_date:
-        try:
-            ensure_is_adult(payload.birth_date)
-        except AgeRestrictionError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        current_user.birth_date = payload.birth_date
+    if payload.email and payload.email != current_user.email:
+        existing_user = db.query(User).filter(User.email == payload.email).first()
+        if existing_user and existing_user.id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="User with this email already exists",
+            )
+        current_user.email = payload.email
 
     if payload.first_name:
         current_user.first_name = payload.first_name
     if payload.last_name:
         current_user.last_name = payload.last_name
-    if payload.region:
-        current_user.region = payload.region
-    if payload.city:
-        current_user.city = payload.city
     if payload.password:
         current_user.hashed_password = hash_password(payload.password)
 
