@@ -1,220 +1,334 @@
 from __future__ import annotations
 
-import asyncio
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Tuple
+from datetime import datetime, timezone
+from typing import Dict, Iterable, List, Tuple
 
-import httpx
 from fastapi import HTTPException, status
+from sqlalchemy.orm import Session
 
-from ..config import settings
-from ..schemas import CryptoDashboardResponse, MarketChartPoint, MarketMover, PortfolioAsset
+from ..models import User, Wallet, WalletHolding, WalletTransaction
+from ..schemas import (
+    CryptoDashboardResponse,
+    MarketChartPoint,
+    MarketMover,
+    PortfolioAsset,
+    PriceQuote,
+    TradeExecutionResponse,
+    WalletSummary,
+)
+from .coincap import fetch_asset, fetch_assets, fetch_assets_by_ids, fetch_history, fetch_top_assets
+from .coingecko import fetch_price_usd
 
-_DASHBOARD_CACHE: Dict[str, Tuple[datetime, CryptoDashboardResponse]] = {}
-_DASHBOARD_CACHE_TTL = timedelta(minutes=3)
-
-_CHART_COIN_ID = "bitcoin"
+_CHART_ASSET_ID = "bitcoin"
 _CHART_DAYS = 7
-_PORTFOLIO_ALLOCATION: Dict[str, float] = {
-    "bitcoin": 0.45,
-    "ethereum": 2.1,
-    "solana": 18.0,
-    "ripple": 950.0,
-}
-_MARKET_MOVER_IDS = [
-    "bitcoin",
-    "ethereum",
-    "solana",
-    "ripple",
-    "cardano",
-    "dogecoin",
-]
 
 
-async def _get_from_coingecko(endpoint: str, params: Dict[str, Any]) -> Any:
-    url = f"{settings.coingecko_base_url.rstrip('/')}/{endpoint.lstrip('/')}"
-    headers: Dict[str, str] = {}
-    if settings.coingecko_demo_api_key:
-        headers["x-cg-demo-api-key"] = settings.coingecko_demo_api_key
-
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.get(url, params=params, headers=headers)
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Failed to reach CoinGecko: {exc}",
-        )
-
-    if response.status_code == 429:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="CoinGecko rate limit exceeded, please retry later",
-        )
-
-    if response.status_code >= 400:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"CoinGecko API error: {response.text}",
-        )
-
-    return response.json()
+def _icon_for_symbol(symbol: str | None) -> str | None:
+    if not symbol:
+        return None
+    return f"https://assets.coincap.io/assets/icons/{symbol.lower()}@2x.png"
 
 
-async def fetch_simple_prices(ids: List[str], vs_currency: str) -> Dict[str, Any]:
-    if not ids:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one asset id must be provided",
-        )
-
-    params = {"ids": ",".join(ids), "vs_currencies": vs_currency}
-    data = await _get_from_coingecko("simple/price", params=params)
-
-    if not data:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No pricing data returned for the requested assets",
-        )
-    return data
+async def _ensure_wallet(db: Session, user: User) -> Wallet:
+    wallet = user.wallet
+    if wallet is None:
+        wallet = Wallet(user_id=user.id, base_currency="USD", cash_balance=0.0)
+        db.add(wallet)
+        db.commit()
+        db.refresh(wallet)
+    return wallet
 
 
-async def fetch_ohlc(coin_id: str, vs_currency: str, days: int) -> List[List[float]]:
-    endpoint = f"coins/{coin_id}/ohlc"
-    params = {"vs_currency": vs_currency, "days": days}
-    data = await _get_from_coingecko(endpoint, params=params)
-
-    if not data:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No OHLC data returned for the requested asset",
-        )
-    return data
-
-
-async def fetch_dashboard(vs_currency: str) -> CryptoDashboardResponse:
-    cache_key = vs_currency.lower()
-    now = datetime.now(timezone.utc)
-    cached = _DASHBOARD_CACHE.get(cache_key)
-    if cached is not None:
-        expires_at, cached_payload = cached
-        if now < expires_at:
-            return cached_payload
-
-    target_ids = sorted(
-        set(_MARKET_MOVER_IDS)
-        .union(_PORTFOLIO_ALLOCATION.keys())
-        .union({_CHART_COIN_ID})
-    )
-    markets_params = {
-        "vs_currency": cache_key,
-        "ids": ",".join(target_ids),
-        "order": "market_cap_desc",
-        "per_page": len(target_ids),
-        "page": 1,
-        "sparkline": "false",
-        "price_change_percentage": "24h",
-    }
-    chart_params = {
-        "vs_currency": cache_key,
-        "days": _CHART_DAYS,
-    }
-
-    markets_task = asyncio.create_task(
-        _get_from_coingecko("coins/markets", params=markets_params)
-    )
-    chart_task = asyncio.create_task(
-        _get_from_coingecko(
-            f"coins/{_CHART_COIN_ID}/market_chart", params=chart_params
-        )
-    )
-    markets_data, chart_data = await asyncio.gather(markets_task, chart_task)
-
-    if not markets_data:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="CoinGecko returned an empty markets payload",
-        )
-
-    markets_by_id = {item["id"]: item for item in markets_data}
-    missing_assets = [coin_id for coin_id in target_ids if coin_id not in markets_by_id]
-    if missing_assets:
-        missing = ", ".join(missing_assets)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"CoinGecko response missing assets: {missing}",
-        )
-
-    chart_points = [
-        MarketChartPoint(timestamp=int(point[0]), price=float(point[1]))
-        for point in chart_data.get("prices", [])
-    ]
-
-    movers_source = [
-        markets_by_id[coin_id] for coin_id in _MARKET_MOVER_IDS if coin_id in markets_by_id
-    ]
-    movers_sorted = sorted(
-        movers_source,
-        key=lambda item: item.get("price_change_percentage_24h") or float("-inf"),
-        reverse=True,
-    )
-    market_movers = [
-        MarketMover(
-            id=item["id"],
-            name=item["name"],
-            symbol=item["symbol"].upper(),
-            pair=f"{item['symbol'].upper()}/{cache_key.upper()}",
-            current_price=float(item.get("current_price") or 0.0),
-            change_24h_pct=float(item.get("price_change_percentage_24h") or 0.0),
-            volume_24h=float(item.get("total_volume") or 0.0),
-            image_url=item.get("image"),
-        )
-        for item in movers_sorted[:4]
-    ]
-
-    portfolio_items: List[PortfolioAsset] = []
+def _compute_portfolio_assets(
+    holdings: Iterable[WalletHolding],
+    quotes: Dict[str, Dict[str, object]],
+) -> Tuple[List[PortfolioAsset], float, float]:
+    items: List[PortfolioAsset] = []
     current_balance = 0.0
     previous_balance = 0.0
-    for coin_id, quantity in _PORTFOLIO_ALLOCATION.items():
-        market = markets_by_id.get(coin_id)
-        if market is None:
+
+    for holding in holdings:
+        quote = quotes.get(holding.asset_id)
+        if quote is None:
             continue
 
-        price = float(market.get("current_price") or 0.0)
-        change_pct = float(market.get("price_change_percentage_24h") or 0.0)
-        value = quantity * price
-
+        price = float(quote.get("priceUsd") or 0.0)
+        change_pct = float(quote.get("changePercent24Hr") or 0.0)
+        value = price * holding.quantity
         current_balance += value
-        if change_pct > -100.0:
-            previous_balance += value / (1 + change_pct / 100)
 
-        portfolio_items.append(
+        if change_pct > -100.0:
+            previous_price = price / (1 + change_pct / 100)
+            previous_balance += previous_price * holding.quantity
+
+        items.append(
             PortfolioAsset(
-                id=market["id"],
-                name=market["name"],
-                symbol=market["symbol"].upper(),
-                quantity=float(quantity),
+                id=holding.asset_id,
+                name=str(quote.get("name") or holding.name),
+                symbol=str(quote.get("symbol") or holding.symbol).upper(),
+                quantity=float(holding.quantity),
                 current_price=price,
                 value=value,
                 change_24h_pct=change_pct,
-                image_url=market.get("image"),
+                image_url=_icon_for_symbol(str(quote.get("symbol", ""))),
             )
         )
 
-    balance_change_pct = 0.0
-    if previous_balance > 0:
-        balance_change_pct = (current_balance / previous_balance - 1) * 100
+    return items, current_balance, previous_balance
 
-    response = CryptoDashboardResponse(
-        currency=cache_key.upper(),
-        portfolio_balance=current_balance,
-        balance_change_pct=balance_change_pct,
-        chart=chart_points,
-        market_movers=market_movers,
-        portfolio=portfolio_items,
-        last_updated=now,
+
+async def build_wallet_summary(db: Session, user: User) -> WalletSummary:
+    wallet = await _ensure_wallet(db, user)
+    holdings = list(wallet.holdings)
+    quotes = await fetch_assets_by_ids([holding.asset_id for holding in holdings])
+    portfolio_items, holdings_balance, previous_balance = _compute_portfolio_assets(
+        holdings, quotes
     )
 
-    _DASHBOARD_CACHE[cache_key] = (now + _DASHBOARD_CACHE_TTL, response)
-    return response
+    cash_balance = float(wallet.cash_balance or 0.0)
+    total_balance = holdings_balance + cash_balance
+    previous_total = previous_balance + cash_balance
+    balance_change_pct = 0.0
+    if previous_total > 0:
+        balance_change_pct = (total_balance / previous_total - 1) * 100
+
+    return WalletSummary(
+        currency=wallet.base_currency.upper(),
+        cash_balance=cash_balance,
+        holdings_balance=holdings_balance,
+        total_balance=total_balance,
+        balance_change_pct=balance_change_pct,
+        portfolio=portfolio_items,
+        last_updated=datetime.now(timezone.utc),
+    )
+
+
+async def fetch_market_movers(limit: int = 6) -> List[MarketMover]:
+    assets = await fetch_top_assets(limit=limit * 2)
+    movers: List[MarketMover] = []
+    for asset in assets[: limit * 2]:
+        symbol = str(asset.get("symbol") or "").upper()
+        price = float(asset.get("priceUsd") or 0.0)
+        change_pct = float(asset.get("changePercent24Hr") or 0.0)
+        volume_24h = float(asset.get("volumeUsd24Hr") or 0.0)
+        movers.append(
+            MarketMover(
+                id=str(asset.get("id") or ""),
+                name=str(asset.get("name") or ""),
+                symbol=symbol,
+                pair=f"{symbol}/USD",
+                current_price=price,
+                change_24h_pct=change_pct,
+                volume_24h=volume_24h,
+                image_url=_icon_for_symbol(symbol),
+            )
+        )
+
+    movers_sorted = sorted(movers, key=lambda item: item.change_24h_pct, reverse=True)
+    return movers_sorted[:limit]
+
+
+async def fetch_price_quotes(asset_id: str) -> List[PriceQuote]:
+    asset = await fetch_asset(asset_id)
+    symbol = str(asset.get("symbol") or asset_id).upper()
+    price_coincap = float(asset.get("priceUsd") or 0.0)
+    quotes: List[PriceQuote] = [
+        PriceQuote(asset_id=asset_id, symbol=symbol, source="coincap", price=price_coincap)
+    ]
+
+    try:
+        price_gecko = await fetch_price_usd(symbol, asset_id_hint=asset_id)
+        quotes.append(
+            PriceQuote(
+                asset_id=asset_id,
+                symbol=symbol,
+                source="coingecko",
+                price=price_gecko,
+            )
+        )
+    except HTTPException:
+        # Ignore CoinGecko failures; CoinCap quote will still be returned.
+        pass
+
+    # Ensure deterministic order: cheaper first to simplify client-side highlighting.
+    quotes_sorted = sorted(quotes, key=lambda q: q.price)
+    return quotes_sorted
+
+
+async def fetch_dashboard(db: Session, user: User) -> CryptoDashboardResponse:
+    wallet = await _ensure_wallet(db, user)
+    summary = await build_wallet_summary(db, user)
+
+    history = await fetch_history(_CHART_ASSET_ID, days=_CHART_DAYS)
+    chart_points = [
+        MarketChartPoint(
+            timestamp=int(point.get("time") or 0),
+            price=float(point.get("priceUsd") or 0.0),
+        )
+        for point in history
+    ]
+
+    market_movers = await fetch_market_movers(limit=6)
+
+    return CryptoDashboardResponse(
+        currency=summary.currency,
+        portfolio_balance=summary.total_balance,
+        holdings_balance=summary.holdings_balance,
+        cash_balance=summary.cash_balance,
+        balance_change_pct=summary.balance_change_pct,
+        chart=chart_points,
+        market_movers=market_movers,
+        portfolio=summary.portfolio,
+        last_updated=summary.last_updated,
+    )
+
+
+async def deposit_funds(db: Session, user: User, amount: float) -> WalletSummary:
+    if amount <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Deposit amount must be greater than zero",
+        )
+    wallet = await _ensure_wallet(db, user)
+    wallet.cash_balance += amount
+    db.add(
+        WalletTransaction(
+            wallet_id=wallet.id,
+            tx_type="DEPOSIT",
+            quantity=0.0,
+            unit_price=1.0,
+            total_value=amount,
+        )
+    )
+    db.commit()
+    db.refresh(wallet)
+    return await build_wallet_summary(db, user)
+
+
+async def buy_asset(
+    db: Session,
+    user: User,
+    asset_id: str,
+    amount_usd: float,
+    price_source: str = "coincap",
+) -> TradeExecutionResponse:
+    if amount_usd <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Purchase amount must be greater than zero",
+        )
+
+    wallet = await _ensure_wallet(db, user)
+    if wallet.cash_balance < amount_usd:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Not enough cash balance for this purchase. Deposit funds first.",
+        )
+
+    asset = await fetch_asset(asset_id)
+    symbol = str(asset.get("symbol") or "").upper()
+    name = str(asset.get("name") or asset_id)
+
+    if price_source not in {"coincap", "coingecko"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported price source",
+        )
+
+    if price_source == "coingecko":
+        price = await fetch_price_usd(symbol, asset_id_hint=asset_id)
+    else:
+        price = float(asset.get("priceUsd") or 0.0)
+
+    if price <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Received zero price for the requested asset",
+        )
+
+    quantity = amount_usd / price
+
+    holding = next((h for h in wallet.holdings if h.asset_id == asset_id), None)
+    if holding is None:
+        holding = WalletHolding(
+            wallet_id=wallet.id,
+            asset_id=asset_id,
+            symbol=symbol,
+            name=name,
+            quantity=0.0,
+            total_cost=0.0,
+            avg_buy_price=0.0,
+        )
+        db.add(holding)
+
+    holding.quantity += quantity
+    holding.total_cost += amount_usd
+    holding.avg_buy_price = holding.total_cost / holding.quantity if holding.quantity > 0 else 0.0
+
+    wallet.cash_balance -= amount_usd
+
+    db.add(
+        WalletTransaction(
+            wallet_id=wallet.id,
+            asset_id=asset_id,
+            asset_symbol=symbol,
+            asset_name=name,
+            tx_type="BUY",
+            quantity=quantity,
+            unit_price=price,
+            total_value=amount_usd,
+        )
+    )
+    db.add(wallet)
+    db.add(holding)
+    db.commit()
+    db.refresh(wallet)
+
+    summary = await build_wallet_summary(db, user)
+    return TradeExecutionResponse(
+        asset_id=asset_id,
+        symbol=symbol,
+        name=name,
+        quantity=quantity,
+        price=price,
+        spent=amount_usd,
+        cash_balance=summary.cash_balance,
+        total_balance=summary.total_balance,
+        executed_at=summary.last_updated,
+        price_source="coingecko" if price_source == "coingecko" else "coincap",
+    )
+
+
+async def list_wallet_transactions(db: Session, user: User) -> List[WalletTransaction]:
+    wallet = await _ensure_wallet(db, user)
+    return (
+        db.query(WalletTransaction)
+        .filter(WalletTransaction.wallet_id == wallet.id)
+        .order_by(WalletTransaction.created_at.desc())
+        .limit(50)
+        .all()
+    )
+
+
+async def search_assets(search: str | None = None, limit: int = 30) -> List[MarketMover]:
+    assets = await fetch_assets(search=search, limit=limit)
+    movers: List[MarketMover] = []
+    for asset in assets:
+        symbol = str(asset.get("symbol") or "").upper()
+        price = float(asset.get("priceUsd") or 0.0)
+        change_pct = float(asset.get("changePercent24Hr") or 0.0)
+        volume_24h = float(asset.get("volumeUsd24Hr") or 0.0)
+        movers.append(
+            MarketMover(
+                id=str(asset.get("id") or ""),
+                name=str(asset.get("name") or ""),
+                symbol=symbol,
+                pair=f"{symbol}/USD",
+                current_price=price,
+                change_24h_pct=change_pct,
+                volume_24h=volume_24h,
+                image_url=_icon_for_symbol(symbol),
+            )
+        )
+    return movers
 

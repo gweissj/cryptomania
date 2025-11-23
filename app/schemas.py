@@ -1,7 +1,7 @@
 from datetime import date, datetime
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, EmailStr, HttpUrl, constr, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, HttpUrl, constr, field_validator
 
 from .utils import AgeRestrictionError, ensure_is_adult, parse_birth_date
 
@@ -91,8 +91,68 @@ class PortfolioAsset(BaseModel):
 class CryptoDashboardResponse(BaseModel):
     currency: str
     portfolio_balance: float
+    holdings_balance: float = 0.0
+    cash_balance: float = 0.0
     balance_change_pct: float
     chart: list[MarketChartPoint]
     market_movers: list[MarketMover]
     portfolio: list[PortfolioAsset]
     last_updated: datetime
+
+
+class WalletSummary(BaseModel):
+    currency: str
+    cash_balance: float
+    holdings_balance: float
+    total_balance: float
+    balance_change_pct: float
+    portfolio: list[PortfolioAsset]
+    last_updated: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class WalletTransactionItem(BaseModel):
+    id: int
+    tx_type: str
+    asset_id: Optional[str]
+    asset_symbol: Optional[str]
+    asset_name: Optional[str]
+    quantity: float
+    unit_price: float
+    total_value: float
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DepositRequest(BaseModel):
+    amount: float = Field(gt=0, description="Deposit amount in USD")
+
+
+class BuyAssetRequest(BaseModel):
+    asset_id: str
+    amount_usd: float = Field(gt=0, description="How much USD to spend on the asset")
+    source: Literal["coincap", "coingecko"] = Field(
+        default="coincap", description="Pricing source to use for purchase"
+    )
+
+
+class TradeExecutionResponse(BaseModel):
+    asset_id: str
+    symbol: str
+    name: str
+    quantity: float
+    price: float
+    spent: float
+    cash_balance: float
+    total_balance: float
+    executed_at: datetime
+    price_source: Literal["coincap", "coingecko"]
+
+
+class PriceQuote(BaseModel):
+    asset_id: str
+    symbol: str
+    source: Literal["coincap", "coingecko"]
+    price: float
