@@ -75,6 +75,7 @@ class MarketMover(BaseModel):
     change_24h_pct: float
     volume_24h: float
     image_url: Optional[HttpUrl]
+    sparkline: Optional[list[float]] = None
 
 
 class PortfolioAsset(BaseModel):

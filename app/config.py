@@ -23,6 +23,11 @@ class Settings(BaseSettings):
         env="COINGECKO_DEMO_API_KEY",
         description="CoinGecko demo API key for v3 (header x-cg-demo-api-key)",
     )
+    coingecko_api_key: Optional[str] = Field(
+        default=None,
+        env="COINGECKO_API_KEY",
+        description="CoinGecko pro API key (header x-cg-pro-api-key)",
+    )
     coincap_base_url: str = Field(
         default="https://api.coincap.io/v2",
         env="COINCAP_BASE_URL",
