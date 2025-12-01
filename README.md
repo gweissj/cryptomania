@@ -20,10 +20,10 @@ pip install --force-reinstall -r requirements.txt
 docker compose up -d --build
 ```
 
-**После этого можно запустить приложение локально:**
+**Если будете что то менять и перезапускать контейнер: то удалите еще **
+то удалите образы бэка в images или выполните следующую команду откуда делали build:
 ```bash
-$env:DATABASE_URL = "postgresql+psycopg://postgres:postgres@localhost:5434/crypto_db"
-python -m uvicorn app.main:app --reload
+docker compose down -v 
 
 ```
 
