@@ -18,7 +18,7 @@ from ..schemas import (
     WalletSummary,
 )
 from .coincap import fetch_asset, fetch_assets, fetch_assets_by_ids, fetch_history, fetch_top_assets
-from .coingecko import fetch_market_overview, fetch_price_usd, resolve_coin_id
+from .coingecko import fetch_market_overview, fetch_price_usd
 
 _CHART_ASSET_ID = "bitcoin"
 _CHART_DAYS = 7
@@ -142,30 +142,88 @@ async def build_wallet_summary(db: Session, user: User) -> WalletSummary:
 
 
 async def fetch_market_movers(limit: int = 6) -> List[MarketMover]:
+    limit = max(1, limit)
+
+    def _normalize(value: str | None) -> str:
+        if not value:
+            return ""
+        return "".join(ch for ch in value.lower() if ch.isalnum())
+
     try:
-        markets = await fetch_market_overview(limit=limit)
+        markets = await fetch_market_overview(limit=limit * 3)
     except HTTPException:
-        return []
+        markets = []
+
+    try:
+        top_assets = await fetch_top_assets(limit=max(limit * 5, 100))
+    except HTTPException:
+        top_assets = []
+
+    assets_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+    assets_by_name: Dict[str, Dict[str, Any]] = {}
+    for asset in top_assets:
+        if not isinstance(asset, dict):
+            continue
+        asset_id = str(asset.get("id") or "").strip()
+        symbol = str(asset.get("symbol") or "").upper()
+        name = str(asset.get("name") or "")
+        if not asset_id or not symbol:
+            continue
+        assets_by_symbol.setdefault(symbol, []).append(asset)
+        normalized_name = _normalize(name)
+        if normalized_name and normalized_name not in assets_by_name:
+            assets_by_name[normalized_name] = asset
 
     movers: List[MarketMover] = []
+    used_ids: Set[str] = set()
+
     for market in markets:
+        if len(movers) >= limit:
+            break
         if not isinstance(market, dict):
             continue
+
         symbol = str(market.get("symbol") or "").upper()
-        price = float(market.get("current_price") or 0.0)
-        change_pct = float(market.get("price_change_percentage_24h") or 0.0)
-        volume_24h = float(market.get("total_volume") or 0.0)
+        if not symbol:
+            continue
+
+        matched_asset: Dict[str, Any] | None = None
+        for candidate in assets_by_symbol.get(symbol, []):
+            candidate_id = str(candidate.get("id") or "").strip()
+            if candidate_id and candidate_id not in used_ids:
+                matched_asset = candidate
+                break
+
+        if matched_asset is None:
+            normalized_market_name = _normalize(str(market.get("name") or ""))
+            candidate = assets_by_name.get(normalized_market_name)
+            candidate_id = str(candidate.get("id") or "").strip() if candidate else ""
+            if candidate and candidate_id and candidate_id not in used_ids:
+                matched_asset = candidate
+
+        if matched_asset is None:
+            continue
+
+        asset_id = str(matched_asset.get("id") or "").strip()
+        used_ids.add(asset_id)
+
+        price = float(market.get("current_price") or matched_asset.get("priceUsd") or 0.0)
+        change_pct = float(
+            market.get("price_change_percentage_24h") or matched_asset.get("changePercent24Hr") or 0.0
+        )
+        volume_24h = float(market.get("total_volume") or matched_asset.get("volumeUsd24Hr") or 0.0)
         sparkline_raw = (
             (market.get("sparkline_in_7d") or {}).get("price") if isinstance(market, dict) else None
         )
         sparkline: List[float] | None = None
         if isinstance(sparkline_raw, list):
             sparkline = [float(value) for value in sparkline_raw if isinstance(value, (int, float))]
+
         image_url = str(market.get("image") or "").strip() or _icon_for_symbol(symbol)
         movers.append(
             MarketMover(
-                id=str(market.get("id") or ""),
-                name=str(market.get("name") or ""),
+                id=asset_id,
+                name=str(matched_asset.get("name") or market.get("name") or ""),
                 symbol=symbol,
                 pair=f"{symbol}/USD",
                 current_price=price,
@@ -175,6 +233,15 @@ async def fetch_market_movers(limit: int = 6) -> List[MarketMover]:
                 sparkline=sparkline,
             )
         )
+
+    if len(movers) < limit and top_assets:
+        fallback_needed = limit - len(movers)
+        fallback = _build_fallback_market_movers(
+            top_assets,
+            limit=fallback_needed,
+            exclude_ids=used_ids,
+        )
+        movers.extend(fallback)
 
     return movers
 
@@ -383,4 +450,3 @@ async def search_assets(search: str | None = None, limit: int = 30) -> List[Mark
             )
         )
     return movers
-
