@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, Path, Query
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -9,21 +11,35 @@ from ..models import User
 from ..schemas import (
     BuyAssetRequest,
     CryptoDashboardResponse,
+    DeviceCommandAckRequest,
+    DeviceCommandPollResponse,
+    DeviceCommandResponse,
+    DispatchDeviceCommandRequest,
     DepositRequest,
     PriceQuote,
+    SellAssetRequest,
+    SellDashboardResponse,
+    SellExecutionResponse,
+    SellPreviewResponse,
     TradeExecutionResponse,
     WalletSummary,
     WalletTransactionItem,
 )
 from ..services.crypto import (
+    acknowledge_device_command,
     build_wallet_summary,
+    build_sell_dashboard,
     buy_asset,
     deposit_funds,
+    dispatch_device_command,
     fetch_dashboard,
     fetch_market_movers,
     fetch_price_quotes,
     list_wallet_transactions,
+    poll_device_commands,
     search_assets,
+    sell_asset,
+    preview_sale,
 )
 
 
@@ -84,6 +100,95 @@ async def buy_crypto(
         asset_id=payload.asset_id,
         amount_usd=payload.amount_usd,
         price_source=payload.source,
+    )
+
+
+@router.get("/sell/overview", response_model=SellDashboardResponse)
+async def get_sell_overview(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return await build_sell_dashboard(db, current_user)
+
+
+@router.post("/sell/preview", response_model=SellPreviewResponse)
+async def preview_sell(
+    payload: SellAssetRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return await preview_sale(
+        db,
+        current_user,
+        asset_id=payload.asset_id,
+        quantity=payload.quantity,
+        amount_usd=payload.amount_usd,
+        price_source=payload.source,
+    )
+
+
+@router.post("/sell", response_model=SellExecutionResponse)
+async def sell_crypto(
+    payload: SellAssetRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return await sell_asset(
+        db,
+        current_user,
+        asset_id=payload.asset_id,
+        quantity=payload.quantity,
+        amount_usd=payload.amount_usd,
+        price_source=payload.source,
+    )
+
+
+@router.post("/device-commands", response_model=DeviceCommandResponse)
+async def create_device_command(
+    payload: DispatchDeviceCommandRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return await dispatch_device_command(db, current_user, payload)
+
+
+@router.get("/device-commands/poll", response_model=DeviceCommandPollResponse)
+async def poll_commands(
+    target_device: str = Query("desktop", min_length=3, max_length=50),
+    target_device_id: str | None = Query(None, min_length=1, max_length=100),
+    limit: int = Query(10, ge=1, le=20),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    commands = await poll_device_commands(
+        db,
+        current_user,
+        target_device=target_device,
+        target_device_id=target_device_id,
+        limit=limit,
+    )
+    return DeviceCommandPollResponse(
+        commands=commands,
+        polled_at=datetime.now(timezone.utc),
+    )
+
+
+@router.post(
+    "/device-commands/{command_id}/ack",
+    response_model=DeviceCommandResponse,
+    summary="Acknowledge or reject a device command",
+)
+async def acknowledge_command(
+    payload: DeviceCommandAckRequest,
+    command_id: int = Path(..., ge=1),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return await acknowledge_device_command(
+        db,
+        current_user,
+        command_id=command_id,
+        status=payload.status,
     )
 
 

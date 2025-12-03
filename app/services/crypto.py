@@ -1,19 +1,22 @@
 from __future__ import annotations
-
-import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Set, Tuple
 
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
-from ..models import User, Wallet, WalletHolding, WalletTransaction
+from ..models import DeviceCommand, User, Wallet, WalletHolding, WalletTransaction
 from ..schemas import (
     CryptoDashboardResponse,
+    DispatchDeviceCommandRequest,
     MarketChartPoint,
     MarketMover,
     PortfolioAsset,
     PriceQuote,
+    SellDashboardResponse,
+    SellExecutionResponse,
+    SellPreviewResponse,
+    SellableAsset,
     TradeExecutionResponse,
     WalletSummary,
 )
@@ -418,6 +421,173 @@ async def buy_asset(
     )
 
 
+async def _resolve_asset_price(
+    asset: Dict[str, Any],
+    asset_id: str,
+    symbol: str,
+    name: str,
+    price_source: str,
+) -> float:
+    if price_source not in {"coincap", "coingecko"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported price source",
+        )
+
+    if price_source == "coingecko":
+        return await fetch_price_usd(symbol, asset_id_hint=asset_id, asset_name=name)
+
+    return float(asset.get("priceUsd") or 0.0)
+
+
+async def preview_sale(
+    db: Session,
+    user: User,
+    asset_id: str,
+    quantity: float | None,
+    amount_usd: float | None,
+    price_source: str = "coincap",
+) -> SellPreviewResponse:
+    wallet = await _ensure_wallet(db, user)
+    holding = next((h for h in wallet.holdings if h.asset_id == asset_id), None)
+    if holding is None or holding.quantity <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You do not own this asset or quantity is zero.",
+        )
+
+    asset = await fetch_asset(asset_id)
+    symbol = str(asset.get("symbol") or holding.symbol).upper()
+    name = str(asset.get("name") or holding.name or asset_id)
+    price = await _resolve_asset_price(asset, asset_id, symbol, name, price_source)
+
+    if price <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Received zero price for the requested asset",
+        )
+
+    available_quantity = float(holding.quantity)
+
+    if quantity is None and amount_usd is not None:
+        quantity = amount_usd / price
+
+    if quantity is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Quantity could not be determined for sale preview",
+        )
+
+    if quantity > available_quantity:
+        quantity = available_quantity
+
+    proceeds = quantity * price
+    is_full_position = abs(quantity - available_quantity) <= available_quantity * 1e-6
+
+    return SellPreviewResponse(
+        asset_id=asset_id,
+        symbol=symbol,
+        name=name,
+        price_source="coingecko" if price_source == "coingecko" else "coincap",
+        unit_price=price,
+        quantity=quantity,
+        proceeds=proceeds,
+        available_quantity=available_quantity,
+        is_full_position=is_full_position,
+    )
+
+
+async def sell_asset(
+    db: Session,
+    user: User,
+    asset_id: str,
+    quantity: float | None,
+    amount_usd: float | None,
+    price_source: str = "coincap",
+) -> SellExecutionResponse:
+    preview = await preview_sale(
+        db,
+        user,
+        asset_id=asset_id,
+        quantity=quantity,
+        amount_usd=amount_usd,
+        price_source=price_source,
+    )
+    wallet = await _ensure_wallet(db, user)
+    holding = next((h for h in wallet.holdings if h.asset_id == asset_id), None)
+    if holding is None or holding.quantity <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You do not own this asset or quantity is zero.",
+        )
+
+    quantity_to_sell = preview.quantity
+    proceeds = preview.proceeds
+
+    if quantity_to_sell <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Sale quantity must be greater than zero",
+        )
+
+    if quantity_to_sell > holding.quantity + 1e-9:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Not enough asset quantity to complete the sale",
+        )
+
+    avg_buy_before = float(holding.avg_buy_price or 0.0)
+
+    wallet.cash_balance += proceeds
+    holding.quantity -= quantity_to_sell
+    holding.total_cost -= avg_buy_before * quantity_to_sell
+    if holding.total_cost < 0:
+        holding.total_cost = 0.0
+    holding.avg_buy_price = (
+        holding.total_cost / holding.quantity if holding.quantity > 0 else 0.0
+    )
+
+    if holding.quantity <= 1e-9:
+        holding.quantity = 0.0
+        holding.total_cost = 0.0
+        holding.avg_buy_price = 0.0
+
+    realized_pnl = proceeds - (preview.quantity * avg_buy_before)
+
+    db.add(
+        WalletTransaction(
+            wallet_id=wallet.id,
+            asset_id=asset_id,
+            asset_symbol=preview.symbol,
+            asset_name=preview.name,
+            tx_type="SELL",
+            quantity=preview.quantity,
+            unit_price=preview.unit_price,
+            total_value=proceeds,
+        )
+    )
+    db.add(wallet)
+    db.add(holding)
+    db.commit()
+    db.refresh(wallet)
+
+    summary = await build_wallet_summary(db, user)
+
+    return SellExecutionResponse(
+        asset_id=asset_id,
+        symbol=preview.symbol,
+        name=preview.name,
+        quantity=preview.quantity,
+        price=preview.unit_price,
+        received=proceeds,
+        cash_balance=summary.cash_balance,
+        total_balance=summary.total_balance,
+        executed_at=summary.last_updated,
+        price_source=preview.price_source,
+        realized_pnl=realized_pnl,
+    )
+
+
 async def list_wallet_transactions(db: Session, user: User) -> List[WalletTransaction]:
     wallet = await _ensure_wallet(db, user)
     return (
@@ -450,3 +620,150 @@ async def search_assets(search: str | None = None, limit: int = 30) -> List[Mark
             )
         )
     return movers
+
+
+async def build_sell_dashboard(db: Session, user: User) -> SellDashboardResponse:
+    wallet = await _ensure_wallet(db, user)
+    holdings = [holding for holding in wallet.holdings if holding.quantity > 0]
+    if not holdings:
+        return SellDashboardResponse(
+            currency=wallet.base_currency.upper(),
+            cash_balance=float(wallet.cash_balance or 0.0),
+            holdings=[],
+            total_sellable_value=0.0,
+            updated_at=datetime.now(timezone.utc),
+        )
+
+    quotes = await fetch_assets_by_ids([holding.asset_id for holding in holdings])
+    items: List[SellableAsset] = []
+    total_value = 0.0
+
+    for holding in holdings:
+        quote = quotes.get(holding.asset_id) or {}
+        price = float(quote.get("priceUsd") or 0.0)
+        current_value = price * holding.quantity
+        total_value += current_value
+        cost_basis = float(holding.total_cost or 0.0)
+        pnl = current_value - cost_basis
+        pnl_pct = (pnl / cost_basis * 100) if cost_basis > 0 else 0.0
+
+        items.append(
+            SellableAsset(
+                id=holding.asset_id,
+                name=str(quote.get("name") or holding.name),
+                symbol=str(quote.get("symbol") or holding.symbol).upper(),
+                quantity=float(holding.quantity),
+                avg_buy_price=float(holding.avg_buy_price or 0.0),
+                current_price=price,
+                current_value=current_value,
+                unrealized_pnl=pnl,
+                unrealized_pnl_pct=pnl_pct,
+            )
+        )
+
+    return SellDashboardResponse(
+        currency=wallet.base_currency.upper(),
+        cash_balance=float(wallet.cash_balance or 0.0),
+        holdings=items,
+        total_sellable_value=total_value,
+        updated_at=datetime.now(timezone.utc),
+    )
+
+
+async def dispatch_device_command(
+    db: Session,
+    user: User,
+    request: DispatchDeviceCommandRequest,
+) -> DeviceCommand:
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=request.ttl_seconds)
+
+    command = DeviceCommand(
+        user_id=user.id,
+        source_device=request.source_device,
+        source_device_id=request.source_device_id,
+        target_device=request.target_device,
+        target_device_id=request.target_device_id,
+        action=request.action,
+        payload=request.payload or {},
+        status="PENDING",
+        expires_at=expires_at,
+    )
+    db.add(command)
+    db.commit()
+    db.refresh(command)
+    return command
+
+
+async def poll_device_commands(
+    db: Session,
+    user: User,
+    target_device: str,
+    target_device_id: str | None = None,
+    limit: int = 10,
+) -> List[DeviceCommand]:
+    now = datetime.now(timezone.utc)
+    expired_commands = (
+        db.query(DeviceCommand)
+        .filter(
+            DeviceCommand.user_id == user.id,
+            DeviceCommand.status == "PENDING",
+            DeviceCommand.expires_at.isnot(None),
+            DeviceCommand.expires_at <= now,
+        )
+        .all()
+    )
+    for command in expired_commands:
+        command.status = "EXPIRED"
+        command.executed_at = now
+        db.add(command)
+    if expired_commands:
+        db.commit()
+
+    query = (
+        db.query(DeviceCommand)
+        .filter(
+            DeviceCommand.user_id == user.id,
+            DeviceCommand.status == "PENDING",
+            DeviceCommand.target_device == target_device,
+        )
+        .order_by(DeviceCommand.created_at.asc())
+        .limit(limit)
+    )
+    commands = query.all()
+
+    if target_device_id:
+        commands = [
+            command
+            for command in commands
+            if command.target_device_id is None or command.target_device_id == target_device_id
+        ]
+
+    return commands
+
+
+async def acknowledge_device_command(
+    db: Session,
+    user: User,
+    command_id: int,
+    status: str,
+) -> DeviceCommand:
+    command = (
+        db.query(DeviceCommand)
+        .filter(DeviceCommand.id == command_id, DeviceCommand.user_id == user.id)
+        .first()
+    )
+    if command is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Command not found")
+
+    if command.status not in {"PENDING", "ACKNOWLEDGED", "FAILED"}:
+        return command
+
+    if command.status == "PENDING":
+        command.status = status
+        command.executed_at = datetime.now(timezone.utc)
+        db.add(command)
+        db.commit()
+        db.refresh(command)
+
+    return command

@@ -1,7 +1,16 @@
 from datetime import date, datetime
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, HttpUrl, constr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    HttpUrl,
+    constr,
+    field_validator,
+    model_validator,
+)
 
 from .utils import AgeRestrictionError, ensure_is_adult, parse_birth_date
 
@@ -139,6 +148,25 @@ class BuyAssetRequest(BaseModel):
     )
 
 
+class SellAssetRequest(BaseModel):
+    asset_id: str
+    quantity: Optional[float] = Field(
+        default=None, gt=0, description="How many units of the asset to sell"
+    )
+    amount_usd: Optional[float] = Field(
+        default=None, gt=0, description="How many USD worth of the asset to sell"
+    )
+    source: Literal["coincap", "coingecko"] = Field(
+        default="coincap", description="Pricing source to use for sale"
+    )
+
+    @model_validator(mode="after")
+    def ensure_quantity_or_amount(cls, values: "SellAssetRequest") -> "SellAssetRequest":
+        if values.quantity is None and values.amount_usd is None:
+            raise ValueError("Either quantity or amount_usd must be provided")
+        return values
+
+
 class TradeExecutionResponse(BaseModel):
     asset_id: str
     symbol: str
@@ -152,8 +180,88 @@ class TradeExecutionResponse(BaseModel):
     price_source: Literal["coincap", "coingecko"]
 
 
+class SellExecutionResponse(BaseModel):
+    asset_id: str
+    symbol: str
+    name: str
+    quantity: float
+    price: float
+    received: float
+    cash_balance: float
+    total_balance: float
+    executed_at: datetime
+    price_source: Literal["coincap", "coingecko"]
+    realized_pnl: float
+
+
+class SellPreviewResponse(BaseModel):
+    asset_id: str
+    symbol: str
+    name: str
+    price_source: Literal["coincap", "coingecko"]
+    unit_price: float
+    quantity: float
+    proceeds: float
+    available_quantity: float
+    is_full_position: bool
+
+
+class SellableAsset(BaseModel):
+    id: str
+    name: str
+    symbol: str
+    quantity: float
+    avg_buy_price: float
+    current_price: float
+    current_value: float
+    unrealized_pnl: float
+    unrealized_pnl_pct: float
+
+
+class SellDashboardResponse(BaseModel):
+    currency: str
+    cash_balance: float
+    holdings: list[SellableAsset]
+    total_sellable_value: float
+    updated_at: datetime
+
+
 class PriceQuote(BaseModel):
     asset_id: str
     symbol: str
     source: Literal["coincap", "coingecko"]
     price: float
+
+
+class DispatchDeviceCommandRequest(BaseModel):
+    action: constr(min_length=1, max_length=100)
+    payload: Optional[dict[str, Any]] = None
+    source_device: constr(min_length=1, max_length=50) = "mobile"
+    source_device_id: Optional[constr(min_length=1, max_length=100)] = None
+    target_device: constr(min_length=1, max_length=50) = "desktop"
+    target_device_id: Optional[constr(min_length=1, max_length=100)] = None
+    ttl_seconds: int = Field(default=60, ge=5, le=3600)
+
+
+class DeviceCommandResponse(BaseModel):
+    id: int
+    action: str
+    payload: Optional[dict[str, Any]]
+    source_device: str
+    source_device_id: Optional[str]
+    target_device: str
+    target_device_id: Optional[str]
+    status: str
+    expires_at: Optional[datetime]
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DeviceCommandPollResponse(BaseModel):
+    commands: list[DeviceCommandResponse]
+    polled_at: datetime
+
+
+class DeviceCommandAckRequest(BaseModel):
+    status: Literal["ACKNOWLEDGED", "FAILED"]

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import List, Optional
 
-from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, func
+from sqlalchemy import JSON, Date, DateTime, Float, ForeignKey, Integer, String, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -32,6 +32,9 @@ class User(Base):
     )
     wallet: Mapped[Optional["Wallet"]] = relationship(
         "Wallet", back_populates="user", uselist=False, cascade="all, delete-orphan"
+    )
+    device_commands: Mapped[List["DeviceCommand"]] = relationship(
+        "DeviceCommand", back_populates="user", cascade="all, delete-orphan"
     )
 
 
@@ -113,3 +116,26 @@ class WalletTransaction(Base):
     )
 
     wallet: Mapped["Wallet"] = relationship("Wallet", back_populates="transactions")
+
+
+class DeviceCommand(Base):
+    __tablename__ = "device_commands"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_device: Mapped[str] = mapped_column(String(50), nullable=False)
+    source_device_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    target_device: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    target_device_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    action: Mapped[str] = mapped_column(String(100), nullable=False)
+    payload: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING", index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    executed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped["User"] = relationship("User", back_populates="device_commands")
